@@ -126,9 +126,37 @@ public class Main implements IXposedHookLoadPackage {
                             lastUrlTs = now;
                             if (isInterestingH5(url)) {
                                 log("WEB-REQ: " + url);
-                                // v1.1: 对核心收益接口尝试独立抓取 body(不影响页面)
-                                tryFetchBody(url);
                             }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        if (!cfgEnabled) return;
+                        try {
+                            Object result = param.getResult();
+                            if (result == null) return; // X5 默认不拦截, 拿不到 body
+                            String url = String.valueOf(XposedHelpers.callMethod(
+                                    param.args[1], "getUrl"));
+                            if (url == null || url.isEmpty()) return;
+                            if (!isIncomeUrl(url)) return; // 只处理收益接口
+
+                            // 读取应用返回的真实响应流
+                            Object data = XposedHelpers.callMethod(result, "getData");
+                            if (!(data instanceof InputStream)) return;
+                            byte[] raw = readAll((InputStream) data, MAX_BODY);
+                            logResponse("H5-REAL", url, raw);
+
+                            // v1.2: 先原样重建返回(确认真实 JSON 结构, 不改数据)
+                            String mime = (String) XposedHelpers.callMethod(result, "getMimeType");
+                            String enc = (String) XposedHelpers.callMethod(result, "getEncoding");
+                            Class<?> wrr = XposedHelpers.findClass(
+                                    "com.tencent.smtt.export.external.interfaces.WebResourceResponse",
+                                    param.args[1].getClass().getClassLoader());
+                            Object newResp = XposedHelpers.newInstance(wrr, mime, enc,
+                                    new java.io.ByteArrayInputStream(raw));
+                            param.setResult(newResp);
                         } catch (Throwable ignored) {
                         }
                     }
@@ -136,47 +164,14 @@ public class Main implements IXposedHookLoadPackage {
     }
 
     /**
-     * v1.1: 主动独立请求抓取收益接口响应体.
-     * 注意: X5 的 shouldInterceptRequest 返回 null 时不经过回调, 拿不到 body.
-     * 这里用独立 HttpURLConnection 请求相同 URL 获取 body 记录(不改变页面数据流).
+     * 收益相关接口(最终要改数字的目标)
      */
-    private void tryFetchBody(final String url) {
-        try {
-            Thread t = new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
-                                new java.net.URL(url).openConnection();
-                        conn.setConnectTimeout(5000);
-                        conn.setReadTimeout(5000);
-                        conn.setRequestMethod("GET");
-                        conn.setRequestProperty("User-Agent", "yuewenAuthorApp/3.82.0.1541");
-                        // 带上 X5 cookie(登录态)
-                        try {
-                            Object cm = XposedHelpers.callStaticMethod(
-                                    XposedHelpers.findClass("com.tencent.smtt.sdk.CookieManager", conn.getClass().getClassLoader()),
-                                    "getInstance");
-                            String cookie = (String) XposedHelpers.callMethod(cm, "getCookie", url);
-                            if (cookie != null && !cookie.isEmpty())
-                                conn.setRequestProperty("Cookie", cookie);
-                        } catch (Throwable ignored) {
-                        }
-                        int code = conn.getResponseCode();
-                        InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
-                        byte[] data = readAll(in, MAX_BODY);
-                        in.close();
-                        logResponse("H5-BODY", url + " [HTTP " + code + "]", data);
-                        conn.disconnect();
-                    } catch (Throwable t2) {
-                        log("H5-BODY 抓取失败: " + url + " err=" + t2);
-                    }
-                }
-            });
-            t.setDaemon(true);
-            t.start();
-        } catch (Throwable ignored) {
-        }
+    private boolean isIncomeUrl(String url) {
+        if (url == null) return false;
+        String u = url.toLowerCase(Locale.US);
+        return u.contains("/income/") || u.contains("incomedata")
+                || u.contains("incomebynovellines") || u.contains("incomemaxmonth")
+                || u.contains("getallcompany");
     }
 
     private boolean isInterestingH5(String url) {
