@@ -99,86 +99,82 @@ public class Main implements IXposedHookLoadPackage {
 
     // ==================== X5 WebView H5 监听 ====================
 
+    // 最近记录的URL去重(同一请求X5会链式调用多次)
+    private static String lastUrl = "";
+    private static long lastUrlTs = 0;
+
     private void hookX5WebViewClient(final XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
         ClassLoader cl = lpparam.classLoader;
         Class<?> wv = XposedHelpers.findClass("com.tencent.smtt.sdk.WebView", cl);
         Class<?> req = XposedHelpers.findClass("com.tencent.smtt.export.external.interfaces.WebResourceRequest", cl);
-        Class<?> resp = XposedHelpers.findClass("com.tencent.smtt.export.external.interfaces.WebResourceResponse", cl);
 
-        // 重载1: shouldInterceptRequest(WebView, WebResourceRequest)
+        // 只 hook 重载1: shouldInterceptRequest(WebView, WebResourceRequest)
+        // beforeHookedMethod 只记录URL, 完全不触碰返回值, 零副作用
         XposedHelpers.findAndHookMethod("com.tencent.smtt.sdk.WebViewClient", cl,
                 "shouldInterceptRequest", wv, req, new XC_MethodHook() {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        handleIntercept(param, 1);
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        if (!cfgEnabled) return;
+                        try {
+                            String url = String.valueOf(XposedHelpers.callMethod(
+                                    param.args[1], "getUrl"));
+                            if (url == null || url.isEmpty()) return;
+                            // 3秒内同一URL只记一次
+                            long now = System.currentTimeMillis();
+                            if (url.equals(lastUrl) && now - lastUrlTs < 3000) return;
+                            lastUrl = url;
+                            lastUrlTs = now;
+                            if (isInterestingH5(url)) {
+                                log("WEB-REQ: " + url);
+                                // v1.1: 对核心收益接口尝试独立抓取 body(不影响页面)
+                                tryFetchBody(url);
+                            }
+                        } catch (Throwable ignored) {
+                        }
                     }
                 });
-
-        // 重载2: shouldInterceptRequest(WebView, WebResourceRequest, Bundle)
-        try {
-            XposedHelpers.findAndHookMethod("com.tencent.smtt.sdk.WebViewClient", cl,
-                    "shouldInterceptRequest", wv, req, android.os.Bundle.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                            handleIntercept(param, 2);
-                        }
-                    });
-        } catch (Throwable ignored) {
-        }
-
-        // 重载3: shouldInterceptRequest(WebView, String)
-        try {
-            XposedHelpers.findAndHookMethod("com.tencent.smtt.sdk.WebViewClient", cl,
-                    "shouldInterceptRequest", wv, String.class, new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                            handleIntercept(param, 3);
-                        }
-                    });
-        } catch (Throwable ignored) {
-        }
     }
 
-    private void handleIntercept(XC_MethodHook.MethodHookParam param, int mode) throws Throwable {
-        if (!cfgEnabled) return;
+    /**
+     * v1.1: 主动独立请求抓取收益接口响应体.
+     * 注意: X5 的 shouldInterceptRequest 返回 null 时不经过回调, 拿不到 body.
+     * 这里用独立 HttpURLConnection 请求相同 URL 获取 body 记录(不改变页面数据流).
+     */
+    private void tryFetchBody(final String url) {
         try {
-            String url = null;
-            Object arg = param.args[mode == 3 ? 1 : 1];
-            if (mode == 3) {
-                url = (String) arg;
-            } else {
-                try {
-                    url = String.valueOf(XposedHelpers.callMethod(arg, "getUrl"));
-                } catch (Throwable ignored) {
+            Thread t = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
+                                new java.net.URL(url).openConnection();
+                        conn.setConnectTimeout(5000);
+                        conn.setReadTimeout(5000);
+                        conn.setRequestMethod("GET");
+                        conn.setRequestProperty("User-Agent", "yuewenAuthorApp/3.82.0.1541");
+                        // 带上 X5 cookie(登录态)
+                        try {
+                            Object cm = XposedHelpers.callStaticMethod(
+                                    XposedHelpers.findClass("com.tencent.smtt.sdk.CookieManager", conn.getClass().getClassLoader()),
+                                    "getInstance");
+                            String cookie = (String) XposedHelpers.callMethod(cm, "getCookie", url);
+                            if (cookie != null && !cookie.isEmpty())
+                                conn.setRequestProperty("Cookie", cookie);
+                        } catch (Throwable ignored) {
+                        }
+                        int code = conn.getResponseCode();
+                        InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+                        byte[] data = readAll(in, MAX_BODY);
+                        in.close();
+                        logResponse("H5-BODY", url + " [HTTP " + code + "]", data);
+                        conn.disconnect();
+                    } catch (Throwable t2) {
+                        log("H5-BODY 抓取失败: " + url + " err=" + t2);
+                    }
                 }
-            }
-            if (url == null) return;
-
-            Object result = param.getResult();
-            if (result == null) {
-                // 未拦截(返回null表示继续走网络) —— 只记 URL, body 无从获取
-                if (isInterestingH5(url)) log("WEB-REQ: " + url);
-                return;
-            }
-
-            // 已有响应(缓存或上流拦截) —— 读取 body 记录, 并重建返回(不破坏原流)
-            if (!isInterestingH5(url)) return;
-            try {
-                String mime = String.valueOf(XposedHelpers.callMethod(result, "getMimeType"));
-                InputStream in = (InputStream) XposedHelpers.callMethod(result, "getData");
-                byte[] data = readAll(in, MAX_BODY);
-                logResponse("H5", url, data);
-
-                // 重建 WebResourceResponse (老式构造: mime, encoding, data)
-                Class<?> impl = XposedHelpers.findClass("com.tencent.smtt.sdk.WebResourceResponse",
-                        param.method.getDeclaringClass().getClassLoader());
-                Object newResp = XposedHelpers.newInstance(impl, mime, "utf-8",
-                        new java.io.ByteArrayInputStream(data));
-                param.setResult(newResp);
-            } catch (Throwable t) {
-                log("H5 body 处理失败: " + url + " err=" + t);
-            }
+            });
+            t.setDaemon(true);
+            t.start();
         } catch (Throwable ignored) {
         }
     }
