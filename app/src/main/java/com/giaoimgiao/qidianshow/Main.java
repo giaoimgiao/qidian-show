@@ -143,7 +143,7 @@ public class Main implements IXposedHookLoadPackage {
                                     byte[] raw = fetchIncomeBody(cl, url, headers);
                                     if (raw != null && raw.length > 0) {
                                         logResponse("H5-RAW", url, raw);
-                                        byte[] body = applyIncomeConfig(raw);
+                                        byte[] body = applyIncomeConfig(url, raw);
                                         if (body != raw) {
                                             logResponse("H5-MOD", url, body);
                                         }
@@ -232,7 +232,8 @@ public class Main implements IXposedHookLoadPackage {
         String u = url.toLowerCase(Locale.US);
         return u.contains("/income/") || u.contains("incomedata")
                 || u.contains("incomebynovellines") || u.contains("incomemaxmonth")
-                || u.contains("getallcompany");
+                || u.contains("getallcompany") || u.contains("incomewelfare")
+                || u.contains("incomecopyright") || u.contains("incometax");
     }
 
     private boolean isInterestingH5(String url) {
@@ -286,28 +287,60 @@ public class Main implements IXposedHookLoadPackage {
     }
 
     /**
-     * v1.4: 按配置修改 incomedataV2 的 result.income 字段.
-     * 只替换配置了的目标值, 未配置字段保持原样; JSON 非 income 结构时原样返回.
+     * v1.4/1.5: 按配置修改收益接口响应.
+     * - incomedataV2: 修改 result.income 字段
+     * - getwelfarbymonth: 修改福利汇总(total/rewards) + 明细 records[].welfarincome/rewards
+     * 只替换配置了的目标值, 未配置字段保持原样; 结构不匹配时原样返回.
      */
-    private byte[] applyIncomeConfig(byte[] body) {
+    private byte[] applyIncomeConfig(String url, byte[] body) {
         if (body == null || incomeCfg.isEmpty()) return body;
         try {
             String s = new String(body, "UTF-8");
-            if (!s.contains("\"income\"")) return body;
+            if (!s.contains("\"income\"") && !s.contains("\"welfarDetail\"") && !s.contains("\"total\"")) return body;
             org.json.JSONObject root = new org.json.JSONObject(s);
             org.json.JSONObject result = root.optJSONObject("result");
             if (result == null) return body;
-            org.json.JSONObject income = result.optJSONObject("income");
-            if (income == null) return body;
             boolean changed = false;
-            for (java.util.Map.Entry<String, String> e : incomeCfg.entrySet()) {
-                if (income.has(e.getKey())) {
-                    income.put(e.getKey(), e.getValue());
+
+            if (url != null && url.contains("getwelfarbymonth")) {
+                // 福利汇总: total <- incomeTotal, rewards <- welfarecount
+                String total = incomeCfg.get("incomeTotal");
+                String wc = incomeCfg.get("welfarecount");
+                if (total != null && result.has("total")) {
+                    result.put("total", total);
                     changed = true;
+                }
+                if (wc != null && result.has("rewards")) {
+                    result.put("rewards", wc);
+                    changed = true;
+                }
+                // 福利明细 records[].welfarincome/rewards
+                org.json.JSONObject wd = result.optJSONObject("welfarDetail");
+                if (wd != null && wc != null) {
+                    org.json.JSONArray records = wd.optJSONArray("records");
+                    if (records != null) {
+                        for (int i = 0; i < records.length(); i++) {
+                            org.json.JSONObject rec = records.optJSONObject(i);
+                            if (rec != null) {
+                                if (rec.has("welfarincome")) { rec.put("welfarincome", wc); changed = true; }
+                                if (rec.has("rewards")) { rec.put("rewards", wc); changed = true; }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // incomedataV2: result.income 字段直接替换
+                org.json.JSONObject income = result.optJSONObject("income");
+                if (income == null) return body;
+                for (java.util.Map.Entry<String, String> e : incomeCfg.entrySet()) {
+                    if (income.has(e.getKey())) {
+                        income.put(e.getKey(), e.getValue());
+                        changed = true;
+                    }
                 }
             }
             if (!changed) return body;
-            log("收益改写: " + incomeCfg);
+            log("收益改写(" + (url != null && url.contains("getwelfarbymonth") ? "福利" : "汇总") + "): " + incomeCfg);
             return root.toString().getBytes("UTF-8");
         } catch (Throwable t) {
             log("收益改写失败: " + t);
