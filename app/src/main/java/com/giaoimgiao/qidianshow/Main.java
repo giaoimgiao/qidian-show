@@ -331,11 +331,24 @@ public class Main implements IXposedHookLoadPackage {
             } else {
                 // incomedataV2: result.income 字段直接替换
                 org.json.JSONObject income = result.optJSONObject("income");
-                if (income == null) return body;
-                for (java.util.Map.Entry<String, String> e : incomeCfg.entrySet()) {
-                    if (income.has(e.getKey())) {
-                        income.put(e.getKey(), e.getValue());
-                        changed = true;
+                if (income == null) {
+                    // v1.6: 该月无真实数据(income=null)时, 按配置构造 income 对象, 未配置字段填 0.00
+                    income = new org.json.JSONObject();
+                    String[] keys = {"showincome", "welfarecount", "othercount", "channeljituan",
+                            "channelyido", "channelother", "copyrightPay", "freeincome",
+                            "incomeTotal", "r_selfTotal", "r_otherTotal"};
+                    for (String k : keys) {
+                        String v = incomeCfg.get(k);
+                        income.put(k, v != null ? v : "0.00");
+                    }
+                    result.put("income", income);
+                    changed = true;
+                } else {
+                    for (java.util.Map.Entry<String, String> e : incomeCfg.entrySet()) {
+                        if (income.has(e.getKey())) {
+                            income.put(e.getKey(), e.getValue());
+                            changed = true;
+                        }
                     }
                 }
             }
