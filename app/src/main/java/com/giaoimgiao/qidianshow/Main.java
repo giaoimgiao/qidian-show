@@ -36,6 +36,11 @@ public class Main implements IXposedHookLoadPackage {
     private static final Object LOG_LOCK = new Object();
     private static final int MAX_BODY = 60000; // 单响应体记录上限
 
+    // v1.4: 收益字段修改配置 (income.xxx=目标值)
+    private static final java.util.Map<String, String> incomeCfg =
+            new java.util.concurrent.ConcurrentHashMap<String, String>();
+    private static final String CONF_PATH2 = "/data/data/com.giaoimgiao.qidianshow/files/qidianshow.conf";
+
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
         if (!lpparam.packageName.equals(TARGET)) return;
@@ -135,9 +140,13 @@ public class Main implements IXposedHookLoadPackage {
                                     @SuppressWarnings("unchecked")
                                     java.util.Map<String, String> headers =
                                             (java.util.Map<String, String>) headersObj;
-                                    byte[] body = fetchIncomeBody(cl, url, headers);
-                                    if (body != null && body.length > 0) {
-                                        logResponse("H5-REAL", url, body);
+                                    byte[] raw = fetchIncomeBody(cl, url, headers);
+                                    if (raw != null && raw.length > 0) {
+                                        logResponse("H5-RAW", url, raw);
+                                        byte[] body = applyIncomeConfig(raw);
+                                        if (body != raw) {
+                                            logResponse("H5-MOD", url, body);
+                                        }
                                         Class<?> wrr = XposedHelpers.findClass(
                                                 "com.tencent.smtt.export.external.interfaces.WebResourceResponse", cl);
                                         Object resp = XposedHelpers.newInstance(wrr,
@@ -245,25 +254,65 @@ public class Main implements IXposedHookLoadPackage {
     // ==================== 日志/配置 ====================
 
     private void loadConfig() {
-        try {
-            File f = new File(CONF_PATH);
-            if (!f.exists()) return;
-            java.io.BufferedReader br = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
-            String line;
-            while ((line = br.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty() || line.startsWith("#")) continue;
-                int eq = line.indexOf('=');
-                if (eq <= 0) continue;
-                String k = line.substring(0, eq).trim();
-                String v = line.substring(eq + 1).trim();
-                if ("enabled".equals(k)) cfgEnabled = !"0".equals(v);
+        incomeCfg.clear();
+        // 优先私有目录(设置界面写入), 其次外部配置文件(手动编辑)
+        String[] paths = {CONF_PATH2, CONF_PATH};
+        for (String p : paths) {
+            try {
+                File f = new File(p);
+                if (!f.exists()) continue;
+                java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
+                String line;
+                while ((line = br.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    int eq = line.indexOf('=');
+                    if (eq <= 0) continue;
+                    String k = line.substring(0, eq).trim();
+                    String v = line.substring(eq + 1).trim();
+                    if ("enabled".equals(k)) {
+                        cfgEnabled = !"0".equals(v);
+                    } else if (k.startsWith("income.") && !v.isEmpty()) {
+                        incomeCfg.put(k.substring("income.".length()), v);
+                    }
+                }
+                br.close();
+                if (p.equals(CONF_PATH2)) break; // 私有目录存在则优先且不再读外部
+            } catch (Throwable ignored) {
             }
-            br.close();
-        } catch (Throwable ignored) {
         }
-        log("配置: enabled=" + cfgEnabled);
+        log("配置: enabled=" + cfgEnabled + " income字段=" + incomeCfg.size());
+    }
+
+    /**
+     * v1.4: 按配置修改 incomedataV2 的 result.income 字段.
+     * 只替换配置了的目标值, 未配置字段保持原样; JSON 非 income 结构时原样返回.
+     */
+    private byte[] applyIncomeConfig(byte[] body) {
+        if (body == null || incomeCfg.isEmpty()) return body;
+        try {
+            String s = new String(body, "UTF-8");
+            if (!s.contains("\"income\"")) return body;
+            org.json.JSONObject root = new org.json.JSONObject(s);
+            org.json.JSONObject result = root.optJSONObject("result");
+            if (result == null) return body;
+            org.json.JSONObject income = result.optJSONObject("income");
+            if (income == null) return body;
+            boolean changed = false;
+            for (java.util.Map.Entry<String, String> e : incomeCfg.entrySet()) {
+                if (income.has(e.getKey())) {
+                    income.put(e.getKey(), e.getValue());
+                    changed = true;
+                }
+            }
+            if (!changed) return body;
+            log("收益改写: " + incomeCfg);
+            return root.toString().getBytes("UTF-8");
+        } catch (Throwable t) {
+            log("收益改写失败: " + t);
+            return body;
+        }
     }
 
     private void logResponse(String tag, String url, byte[] body) {
