@@ -104,12 +104,12 @@ public class Main implements IXposedHookLoadPackage {
     private static long lastUrlTs = 0;
 
     private void hookX5WebViewClient(final XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        ClassLoader cl = lpparam.classLoader;
+        final ClassLoader cl = lpparam.classLoader;
         Class<?> wv = XposedHelpers.findClass("com.tencent.smtt.sdk.WebView", cl);
         Class<?> req = XposedHelpers.findClass("com.tencent.smtt.export.external.interfaces.WebResourceRequest", cl);
 
-        // 只 hook 重载1: shouldInterceptRequest(WebView, WebResourceRequest)
-        // beforeHookedMethod 只记录URL, 完全不触碰返回值, 零副作用
+        // hook 重载1: shouldInterceptRequest(WebView, WebResourceRequest)
+        // beforeHookedMethod: 记录URL + 对收益接口接管(带完整请求头同步抓取, setResult 替换响应)
         XposedHelpers.findAndHookMethod("com.tencent.smtt.sdk.WebViewClient", cl,
                 "shouldInterceptRequest", wv, req, new XC_MethodHook() {
                     @Override
@@ -127,40 +127,92 @@ public class Main implements IXposedHookLoadPackage {
                             if (isInterestingH5(url)) {
                                 log("WEB-REQ: " + url);
                             }
-                        } catch (Throwable ignored) {
-                        }
-                    }
-
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        if (!cfgEnabled) return;
-                        try {
-                            Object result = param.getResult();
-                            if (result == null) return; // X5 默认不拦截, 拿不到 body
-                            String url = String.valueOf(XposedHelpers.callMethod(
-                                    param.args[1], "getUrl"));
-                            if (url == null || url.isEmpty()) return;
-                            if (!isIncomeUrl(url)) return; // 只处理收益接口
-
-                            // 读取应用返回的真实响应流
-                            Object data = XposedHelpers.callMethod(result, "getData");
-                            if (!(data instanceof InputStream)) return;
-                            byte[] raw = readAll((InputStream) data, MAX_BODY);
-                            logResponse("H5-REAL", url, raw);
-
-                            // v1.2: 先原样重建返回(确认真实 JSON 结构, 不改数据)
-                            String mime = (String) XposedHelpers.callMethod(result, "getMimeType");
-                            String enc = (String) XposedHelpers.callMethod(result, "getEncoding");
-                            Class<?> wrr = XposedHelpers.findClass(
-                                    "com.tencent.smtt.export.external.interfaces.WebResourceResponse",
-                                    param.args[1].getClass().getClassLoader());
-                            Object newResp = XposedHelpers.newInstance(wrr, mime, enc,
-                                    new java.io.ByteArrayInputStream(raw));
-                            param.setResult(newResp);
+                            // 收益接口: 接管响应(带 X5 完整请求头同步抓取, 成功后替换返回)
+                            if (isIncomeUrl(url)) {
+                                try {
+                                    Object headersObj = XposedHelpers.callMethod(
+                                            param.args[1], "getRequestHeaders");
+                                    @SuppressWarnings("unchecked")
+                                    java.util.Map<String, String> headers =
+                                            (java.util.Map<String, String>) headersObj;
+                                    byte[] body = fetchIncomeBody(cl, url, headers);
+                                    if (body != null && body.length > 0) {
+                                        logResponse("H5-REAL", url, body);
+                                        Class<?> wrr = XposedHelpers.findClass(
+                                                "com.tencent.smtt.export.external.interfaces.WebResourceResponse", cl);
+                                        Object resp = XposedHelpers.newInstance(wrr,
+                                                "application/json", "utf-8",
+                                                new java.io.ByteArrayInputStream(body));
+                                        param.setResult(resp);
+                                    }
+                                } catch (Throwable t) {
+                                    log("收益拦截失败: " + url + " err=" + t);
+                                }
+                            }
                         } catch (Throwable ignored) {
                         }
                     }
                 });
+    }
+
+    // 收益 body 缓存(5分钟), 避免同一 URL 重复抓取
+    private static final java.util.Map<String, CacheEntry> bodyCache = new java.util.concurrent.ConcurrentHashMap<String, CacheEntry>();
+    private static final Object CACHE_LOCK = new Object();
+
+    private static class CacheEntry {
+        byte[] data;
+        long ts;
+        CacheEntry(byte[] d, long t) { data = d; ts = t; }
+    }
+
+    /**
+     * v1.3: 带 X5 完整请求头 + Cookie 同步抓取收益接口 body.
+     * 之前独立抓包 4001 是因为 CookieManager 用错 classloader 导致 cookie 未带上.
+     */
+    private byte[] fetchIncomeBody(final ClassLoader cl, final String url,
+                                   final java.util.Map<String, String> headers) {
+        try {
+            long now = System.currentTimeMillis();
+            CacheEntry ce = bodyCache.get(url);
+            if (ce != null && now - ce.ts < 300000) return ce.data;
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
+                    new java.net.URL(url).openConnection();
+            conn.setConnectTimeout(6000);
+            conn.setReadTimeout(6000);
+            conn.setRequestMethod("GET");
+            if (headers != null) {
+                for (java.util.Map.Entry<String, String> e : headers.entrySet()) {
+                    try { conn.setRequestProperty(e.getKey(), e.getValue()); } catch (Throwable ignored) { }
+                }
+            }
+            // X5 CookieManager (用 App classloader, 之前用错 loader 导致 cookie 丢失)
+            try {
+                Object cm = XposedHelpers.callStaticMethod(
+                        XposedHelpers.findClass("com.tencent.smtt.sdk.CookieManager", cl), "getInstance");
+                String cookie = (String) XposedHelpers.callMethod(cm, "getCookie", url);
+                if (cookie != null && !cookie.isEmpty())
+                    conn.setRequestProperty("Cookie", cookie);
+            } catch (Throwable ignored) { }
+            int code = conn.getResponseCode();
+            if (code >= 400) {
+                log("fetch HTTP " + code + ": " + url);
+                conn.disconnect();
+                return null;
+            }
+            InputStream in = conn.getInputStream();
+            byte[] data = readAll(in, MAX_BODY);
+            in.close();
+            conn.disconnect();
+            if (data.length > 0) {
+                synchronized (CACHE_LOCK) {
+                    bodyCache.put(url, new CacheEntry(data, System.currentTimeMillis()));
+                }
+            }
+            return data;
+        } catch (Throwable t) {
+            log("fetch失败: " + url + " err=" + t);
+            return null;
+        }
     }
 
     /**
