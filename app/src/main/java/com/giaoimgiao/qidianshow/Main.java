@@ -303,11 +303,11 @@ public class Main implements IXposedHookLoadPackage {
             boolean changed = false;
 
             if (url != null && url.contains("getwelfarbymonth")) {
-                // 福利汇总: total <- incomeTotal, rewards <- welfarecount
-                String total = incomeCfg.get("incomeTotal");
+                // 福利页: 福利总额/打赏/明细统一按福利收入(welfarecount)改写
+                // (注意不能填 incomeTotal, 否则福利页会把总收入当成福利总额)
                 String wc = incomeCfg.get("welfarecount");
-                if (total != null && result.has("total")) {
-                    result.put("total", total);
+                if (wc != null && result.has("total")) {
+                    result.put("total", wc);
                     changed = true;
                 }
                 if (wc != null && result.has("rewards")) {
